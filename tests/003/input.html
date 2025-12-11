@@ -1,0 +1,8 @@
+<!DOCTYPE html>
+<html>
+  <body>
+    <p>First name: <x-var ref="FirstName"/></p>
+    <p>Choose new favorite pet</p>
+    <x-select-foreach class="fancy" id="pet-select" ref="Pets" selected-ref="FavoritePet" option-value-ref="PetId"><x-var ref="PetName"/></x-select-foreach>
+  </body>
+</html>

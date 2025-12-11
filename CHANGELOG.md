@@ -1,4 +1,4 @@
-# Revision history for html-tmpl
+# Revision history
 
 ## 0.1.0.0 -- YYYY-mm-dd
 

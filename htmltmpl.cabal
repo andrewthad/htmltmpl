@@ -1,5 +1,5 @@
 cabal-version:      3.4
-name:               html-tmpl
+name:               htmltmpl
 version:            0.1.0.0
 -- synopsis:
 -- description:
@@ -25,17 +25,18 @@ library
       , primitive >=0.9
       , xmlhtml >=0.2.5.4
       , containers >=0.7
+      , split >=0.2.5
     hs-source-dirs:   src
     default-language: GHC2024
 
-executable html-tmpl
+executable htmltmpl
     import:           warnings
     main-is:          Main.hs
     -- other-modules:
     -- other-extensions:
     build-depends:
-        , base ^>=4.20
-        , html-tmpl
+        , base >=4.20
+        , htmltmpl
         , text >=2.0
         , bytestring >=0.11
         , xmlhtml >=0.2.5.4

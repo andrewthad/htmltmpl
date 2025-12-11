@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+  <body>
+    <h1><x-var ref="FirstName"/></h1>
+    <h2>Pets</h2>
+    <x-foreach-chunked ref="Pets" chunk-size="3">
+      <x-chunk>
+      <div class="row"><x-content/></div>
+      </x-chunk>
+      <x-item>
+      <div class="col-4">
+        <h3><x-var ref="PetName"/></h3>
+        <p>ID: <x-var ref="PetId"/></p>
+      </div>
+      </x-item>
+    </x-foreach-chunked>
+  </body>
+</html>
