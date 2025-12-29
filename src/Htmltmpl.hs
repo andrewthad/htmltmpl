@@ -2,15 +2,18 @@
 {-# language OverloadedStrings #-}
 
 module Htmltmpl
-  ( Substitutions
+  ( Projections
+  , Template
   , compile
   , evaluate
-    -- * Build Substitutions
+  , checkTemplateAgainstProjections
+    -- * Build Projections
   , string
   , array
   , integer
   ) where
 
+import Data.Foldable (traverse_)
 import Data.Text (Text)
 import Data.Primitive (SmallArray)
 import Text.XmlHtml (Node(..))
@@ -19,30 +22,51 @@ import Control.Exception (Exception)
 import Control.Monad (when, join)
 import Text.Read (readMaybe)
 import Data.List.Split (chunksOf)
+import Data.Primitive (sizeofSmallArray)
 
 import qualified Data.Map.Strict as Map
 import qualified Data.Text as Text
 import qualified Data.List as List
 import qualified GHC.Exts as Exts
 
-newtype Substitutions a = Substitutions (Map Text (Field a))
+newtype Projections a = Projections (Map Text (Field a))
 
-instance Semigroup (Substitutions a) where
-  Substitutions x <> Substitutions y = Substitutions (Map.union x y)
+instance Semigroup (Projections a) where
+  Projections x <> Projections y = Projections (Map.union x y)
+
+instance Monoid (Projections a) where
+  mempty = Projections Map.empty
 
 data Field a
   = String (a -> Text)
   | Integer (a -> Integer)
-  | forall b. Array (a -> SmallArray b) (Substitutions b)
+  | forall b. Array (a -> SmallArray b) (Projections b)
 
-data AppliedTemplate = forall a. AppliedTemplate (Substitutions a) a
-data AppliedTemplateForeach = forall a. AppliedTemplateForeach (Substitutions a) !(SmallArray a)
+data AppliedTemplate = forall a. AppliedTemplate (Projections a) a
+data AppliedTemplateForeach = forall a. AppliedTemplateForeach (Projections a) !(SmallArray a)
+
+data Context = Context (Map Text Type)
+deriving stock instance Show Context
+
+data Type
+  = TypeString
+  | TypeInteger
+  | TypeArray Context
+deriving stock instance Show Type
 
 data Template
   = TemplateElement !Text ![(Text,Text)] ![Template]
+  | TemplateEnrichedElement
+      !Text
+      ![(Text,Text)]
+      !Text -- class ref
+      ![Template]
   | TemplateText !Text
   | TemplateVar -- element tag: x-var
       !Text -- var name
+  | TemplateIf -- element tag: x-foreach
+      !Text -- var name (must resolve to an array)
+      ![Template] -- body of the foreach to be replicated
   | TemplateForeach -- element tag: x-foreach
       !Text -- var name (must resolve to an array)
       ![Template] -- body of the foreach to be replicated
@@ -51,23 +75,24 @@ data Template
       !Text -- var name (ref) (must resolve to an array)
       !Text -- the option that should start out selected (selected-ref) (optional, empty means none selected)
       !Text -- var used to extract option value (option-value-ref)
+      !Text -- var used for name field (name-ref, empty means do not use)
       ![Template] -- the body of each option, may reference children
-  | TemplateForeachChunked
+  | TemplateForeachChunked -- Get rid of this. I don't like it.
       !Text -- ref
       !Int -- chunk size (>=1, <=1000)
       ![Template] -- chunk reducer (includes the use of x-content)
       ![Template] -- item reducer (injects individual elements into the context)
-  | TemplateContent
+  | TemplateContent -- used by a function to include the argument content
   | TemplateEmpty
 
-string :: Text -> (a -> Text) -> Substitutions a
-string name f = Substitutions (Map.singleton name (String f))
+string :: Text -> (a -> Text) -> Projections a
+string name f = Projections (Map.singleton name (String f))
 
-integer :: Text -> (a -> Integer) -> Substitutions a
-integer name f = Substitutions (Map.singleton name (Integer f))
+integer :: Text -> (a -> Integer) -> Projections a
+integer name f = Projections (Map.singleton name (Integer f))
 
-array :: Text -> (a -> SmallArray b) -> Substitutions b -> Substitutions a
-array name f t = Substitutions (Map.singleton name (Array f t))
+array :: Text -> (a -> SmallArray b) -> Projections b -> Projections a
+array name f t = Projections (Map.singleton name (Array f t))
 
 fieldToText :: Field a -> a -> Text
 fieldToText field a = case field of
@@ -77,14 +102,14 @@ fieldToText field a = case field of
 lookupAsText :: [AppliedTemplate] -> Text -> Text
 lookupAsText ts name = case ts of
   [] -> "unrecognized name: " <> name
-  AppliedTemplate (Substitutions m) v : ts' -> case Map.lookup name m of
+  AppliedTemplate (Projections m) v : ts' -> case Map.lookup name m of
     Nothing -> lookupAsText ts' name
     Just field -> fieldToText field v
 
 lookupArrayTemplate :: [AppliedTemplate] -> Text -> AppliedTemplateForeach
 lookupArrayTemplate ts name = case ts of
   [] -> error "lookupArrayTemplate: could not find the thing"
-  AppliedTemplate (Substitutions m) v : ts' -> case Map.lookup name m of
+  AppliedTemplate (Projections m) v : ts' -> case Map.lookup name m of
     Nothing -> lookupArrayTemplate ts' name
     Just field -> case field of
       Array f tmpl -> AppliedTemplateForeach tmpl (f v)
@@ -94,6 +119,13 @@ lookupAttr :: Text -> [(Text,Text)] -> Text
 lookupAttr name attrs = case List.lookup name attrs of
   Nothing -> Text.empty
   Just val -> val
+
+appendToClassAttr :: Text -> [(Text, Text)] -> [(Text, Text)]
+appendToClassAttr clsName attrs = case attrs of
+  [] -> [("class", clsName)]
+  pair@(attrName,attrVal) : ys -> case attrName of
+    "class" -> ("class", attrVal <> " " <> clsName) : ys
+    _ -> pair : appendToClassAttr clsName ys
 
 substituteWorker :: [Node] -> [AppliedTemplate] -> Template -> [Node]
 substituteWorker content ctx node = case node of
@@ -110,10 +142,14 @@ substituteWorker content ctx node = case node of
             )
             (chunksOf sz (Exts.toList vals))
        in join chunks
-  TemplateSelectForeach selectAttrs ref selectedRef optionValueRef optionContentTmpls -> case lookupArrayTemplate ctx ref of
+  TemplateSelectForeach selectAttrs0 ref selectedRef optionValueRef nameRef optionContentTmpls -> case lookupArrayTemplate ctx ref of
     AppliedTemplateForeach substs vals ->
       let selectedAsText = lookupAsText ctx selectedRef in
-      [ Element "select" selectAttrs $ map
+      let selectAttrs1 = case nameRef of
+            "" -> selectAttrs0
+            _ -> ("name", lookupAsText ctx nameRef) : selectAttrs0
+       in
+      [ Element "select" selectAttrs1 $ map
         (\val ->
           let ctx' = AppliedTemplate substs val : ctx
               attrs1 = [("value", lookupAsText ctx' optionValueRef)]
@@ -129,11 +165,22 @@ substituteWorker content ctx node = case node of
   TemplateForeach ref children -> case lookupArrayTemplate ctx ref of
     AppliedTemplateForeach tmpl vals ->
       Exts.toList vals >>= (\v -> substituteWorker content (AppliedTemplate tmpl v : ctx) =<< children)
+  TemplateIf ref children -> case lookupArrayTemplate ctx ref of
+    AppliedTemplateForeach _ vals -> if sizeofSmallArray vals == 0
+      then []
+      else substituteWorker content ctx =<< children
+  TemplateEnrichedElement tag attrs classRef children ->
+    let attrs' = case classRef of
+          "" -> attrs
+          _ -> case lookupAsText ctx classRef of
+            "" -> attrs
+            v -> appendToClassAttr v attrs
+     in [Element tag attrs' (substituteWorker content ctx =<< children)]
   TemplateElement tag attrs children -> [Element tag attrs (substituteWorker content ctx =<< children)]
   TemplateText t -> [TextNode t]
   TemplateEmpty -> []
 
-evaluate :: Substitutions a -> a -> Template -> [Node]
+evaluate :: Projections a -> a -> Template -> [Node]
 evaluate tmpl v node = substituteWorker [] [AppliedTemplate tmpl v] node
 
 data TemplatizeError
@@ -150,6 +197,8 @@ data TemplatizeError
   | ForeachChunkedMissingChildren
   | ForeachChunkedMalformedChunkSizeAttribute
   | ForeachChunkedMissingChunkSizeAttribute
+  | IfMissingChildren
+  | IfMissingRefAttribute
 
 deriving stock instance Show TemplatizeError
 deriving anyclass instance Exception TemplatizeError
@@ -169,6 +218,18 @@ nodeToTemplate node = case node of
           True -> Left VarMissingRefAttribute
           False -> Right (TemplateVar ref)
         _ -> Left VarChildrenPresent
+      "div" -> do
+        let classRef = lookupAttr "class-ref" attrs
+        let attrs' = removeMagicAttributes attrs
+        children' <- traverse nodeToTemplate children
+        Right (TemplateEnrichedElement "div" attrs' classRef children')
+      "if" -> case children of
+        [] -> Left IfMissingChildren
+        _ -> let ref = lookupAttr "ref" attrs in case Text.null ref of
+          True -> Left IfMissingRefAttribute
+          False -> do
+            children' <- traverse nodeToTemplate children
+            Right (TemplateIf ref children')
       "foreach" -> case children of
         [] -> Left ForeachMissingChildren
         _ -> let ref = lookupAttr "ref" attrs in case Text.null ref of
@@ -196,13 +257,81 @@ nodeToTemplate node = case node of
           when (Text.null ref) (Left SelectForeachMissingRefAttribute)
           let selectedRef = lookupAttr "selected-ref" attrs
           let optionValueRef = lookupAttr "option-value-ref" attrs
+          let nameRef = lookupAttr "name-ref" attrs
           when (Text.null optionValueRef) (Left SelectForeachMissingOptionValueRef)
           children' <- traverse nodeToTemplate children
-          Right (TemplateSelectForeach (removeMagicAttributes attrs) ref selectedRef optionValueRef children')
+          Right (TemplateSelectForeach (removeMagicAttributes attrs) ref selectedRef optionValueRef nameRef children')
       _ -> Left (UnrecognizedControlTag suffix)
     Nothing -> TemplateElement tag attrs <$> traverse nodeToTemplate children
   TextNode content -> Right (TemplateText content)
   Comment{} -> Right TemplateEmpty
+
+data ContextCheckError
+  = MissingVar !Text
+  | ExpectedVarWithScalarType
+  | IfExpectsArray
+      !Text -- ref name
+      !Type -- ref type
+  | ForeachExpectsArray
+      !Text -- ref name
+      !Type -- ref type
+  | SelectForeachExpectsArray
+      !Text -- ref name
+      !Type -- ref type
+deriving stock instance Show ContextCheckError
+deriving anyclass instance Exception ContextCheckError
+
+data Content = ContentYes | ContentNo
+
+projectionsToContext :: Projections a -> Context
+projectionsToContext (Projections m) = Context (fmap fieldToType m)
+
+fieldToType :: Field a -> Type
+fieldToType = \case
+  String{} -> TypeString
+  Integer{} -> TypeInteger
+  Array _ p -> TypeArray (projectionsToContext p)
+
+requireScalarVarInContext :: Text -> Context -> Either ContextCheckError ()
+requireScalarVarInContext ref (Context ctxMap) = case Map.lookup ref ctxMap of
+  Nothing -> Left (MissingVar ref)
+  Just ty -> case ty of
+    TypeString{} -> pure ()
+    TypeInteger{} -> pure ()
+    _ -> Left ExpectedVarWithScalarType
+
+checkTemplateAgainstProjections :: Projections a -> Template -> Either ContextCheckError ()
+checkTemplateAgainstProjections p tmpl = checkWorker ContentNo (projectionsToContext p) tmpl
+
+checkWorker :: Content -> Context -> Template -> Either ContextCheckError ()
+checkWorker content ctx@(Context ctxMap) tmpl = case tmpl of
+  TemplateElement _ _ children -> traverse_ (checkWorker content ctx) children
+  TemplateText{} -> pure ()
+  TemplateSelectForeach _ ref selectedRef optionValueRef nameRef optionContentTmpls -> case Map.lookup ref ctxMap of
+    Nothing -> Left (MissingVar ref)
+    Just ty -> case ty of
+      TypeArray elemTyCtx@(Context elemTy) -> do
+        when (not (Text.null selectedRef)) (requireScalarVarInContext selectedRef ctx)
+        when (not (Text.null nameRef)) (requireScalarVarInContext nameRef ctx)
+        requireScalarVarInContext optionValueRef elemTyCtx
+        traverse_ (checkWorker content (Context (Map.union elemTy ctxMap))) optionContentTmpls
+      _ -> Left (SelectForeachExpectsArray ref ty)
+  TemplateForeach ref body -> case Map.lookup ref ctxMap of
+    Nothing -> Left (MissingVar ref)
+    Just ty -> case ty of
+      TypeArray (Context elemTy) -> traverse_ (checkWorker content (Context (Map.union elemTy ctxMap))) body
+      _ -> Left (ForeachExpectsArray ref ty)
+  TemplateIf ref body -> case Map.lookup ref ctxMap of
+    Nothing -> Left (MissingVar ref)
+    Just ty -> case ty of
+      TypeArray _ -> traverse_ (checkWorker content ctx) body
+      _ -> Left (IfExpectsArray ref ty)
+  TemplateEnrichedElement _ attrs classRef children -> do
+    when (not (Text.null classRef)) (requireScalarVarInContext classRef ctx)
+    traverse_ (checkWorker content ctx) children
+  TemplateVar ref -> case Map.lookup ref ctxMap of
+    Nothing -> Left (MissingVar ref)
+    Just{} -> pure ()
 
 isWhitespaceNode :: Node -> Bool
 isWhitespaceNode = \case
@@ -217,4 +346,6 @@ removeMagicAttributes xs = case xs of
     "ref" -> removeMagicAttributes ys
     "selected-ref" -> removeMagicAttributes ys
     "option-value-ref" -> removeMagicAttributes ys
+    "name-ref" -> removeMagicAttributes ys
+    "class-ref" -> removeMagicAttributes ys
     _ -> pair : removeMagicAttributes ys

@@ -29,7 +29,10 @@ main = do
       _ -> fail ("Expected a single root node but encountered " ++ show (length nodes) ++ " nodes at the root:\n" ++ show nodes)
     _ -> fail "Expected html, not xml"
   template <- either throwIO pure (H.compile node)
-  BB.hPutBuilder IO.stdout (renderHtmlFragment UTF8 (H.evaluate personTemplate examplePerson template) <> "\n")
+  case H.checkTemplateAgainstProjections personProjections template of
+    Right () -> pure ()
+    Left err -> throwIO err
+  BB.hPutBuilder IO.stdout (renderHtmlFragment UTF8 (H.evaluate personProjections examplePerson template) <> "\n")
 
 data Person = Person
   { firstName :: !Text
@@ -56,8 +59,8 @@ examplePerson = Person
     ]
   }
 
-personTemplate :: H.Substitutions Person
-personTemplate =
+personProjections :: H.Projections Person
+personProjections =
   H.string "FirstName" firstName
   <>
   H.string "LastName" lastName
@@ -66,7 +69,7 @@ personTemplate =
   <>
   H.array "Pets" pets petTemplate
 
-petTemplate :: H.Substitutions Pet
+petTemplate :: H.Projections Pet
 petTemplate =
   H.integer "PetId" ident
   <>
